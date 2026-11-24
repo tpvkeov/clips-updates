@@ -58,8 +58,9 @@ Deno.serve(async (req) => {
     const sessionId = String(body.sessionId ?? "");
     const b2Key = String(body.b2Key ?? "");
     const publicUrl = String(body.publicUrl ?? "");
+    const fileId = String(body.fileId ?? "").trim();
     const sizeBytes = Number(body.sizeBytes ?? 0);
-    if (!sessionId || !b2Key || !publicUrl || sizeBytes <= 0) {
+    if (!sessionId || !b2Key || !publicUrl || !fileId || sizeBytes <= 0) {
       return json({ error: "invalid_payload" }, 400);
     }
 
@@ -87,10 +88,16 @@ Deno.serve(async (req) => {
         Authorization: account.authorizationToken,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ bucketName, fileName: b2Key }),
+      // b2_get_file_info only accepts a fileId — bucketName/fileName are not
+      // valid fields here. The app gets fileId from the b2_upload_file response.
+      body: JSON.stringify({ fileId }),
     });
     if (!infoRes.ok) {
       return json({ error: "file_not_uploaded", detail: await infoRes.text() }, 400);
+    }
+    const info = await infoRes.json();
+    if (info?.fileName && String(info.fileName) !== b2Key) {
+      return json({ error: "file_mismatch", expected: b2Key, actual: String(info.fileName) }, 400);
     }
 
     const videoId = crypto.randomUUID();
