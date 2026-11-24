@@ -22,9 +22,24 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
   try {
-    const keyId = Deno.env.get("B2_KEY_ID")!;
-    const appKey = Deno.env.get("B2_APPLICATION_KEY")!;
-    const bucketName = Deno.env.get("B2_BUCKET_NAME") ?? "clips-videos-ithuzzzkhnbypgvmdugk";
+    const keyId = Deno.env.get("B2_KEY_ID")?.trim();
+    const appKey = Deno.env.get("B2_APPLICATION_KEY")?.trim();
+    const bucketName = Deno.env.get("B2_BUCKET_NAME")?.trim() ||
+      "clips-videos-ithuzzzkhnbypgvmdugk";
+    // Diagnose secret problems without echoing any value back.
+    if (!keyId || !appKey) {
+      const missing = [
+        ...(!keyId ? ["B2_KEY_ID"] : []),
+        ...(!appKey ? ["B2_APPLICATION_KEY"] : []),
+      ];
+      return json({ error: "missing_b2_secrets", missing }, 500);
+    }
+    if (/^['"]|['"]$/.test(appKey)) {
+      return json(
+        { error: "malformed_b2_secret", field: "B2_APPLICATION_KEY", hint: "remove surrounding quotes" },
+        500,
+      );
+    }
 
     const body = await req.json();
     const prefix = String(body.prefix ?? body.fileKey ?? "clips_").trim();
