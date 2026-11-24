@@ -733,6 +733,8 @@ CREATE TABLE IF NOT EXISTS public.suggestions (
 ALTER TABLE public.suggestions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Anyone can submit a suggestion" ON public.suggestions;
 CREATE POLICY "Anyone can submit a suggestion" ON public.suggestions FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Anyone can view suggestions" ON public.suggestions;
+CREATE POLICY "Anyone can view suggestions" ON public.suggestions FOR SELECT USING (true);
 DROP POLICY IF EXISTS "Admins manage suggestions" ON public.suggestions;
 CREATE POLICY "Admins manage suggestions" ON public.suggestions FOR ALL USING (public.is_admin());
 
