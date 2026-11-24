@@ -1,7 +1,7 @@
 // Supabase Edge Function: commit-video
 // Verifies the file exists on B2, finalizes quota and inserts the videos row.
-// Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, B2_KEY_ID,
-//          B2_APPLICATION_KEY, B2_BUCKET_NAME
+// Secrets: SUPABASE_URL, SUPABASE_SECRET_KEYS (or legacy SUPABASE_SERVICE_ROLE_KEY),
+//          B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -83,7 +83,6 @@ Deno.serve(async (req) => {
       method: "POST",
       headers: {
         apikey: serviceKey,
-        Authorization: `Bearer ${serviceKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -101,7 +100,6 @@ Deno.serve(async (req) => {
       method: "POST",
       headers: {
         apikey: serviceKey,
-        Authorization: `Bearer ${serviceKey}`,
         "Content-Type": "application/json",
         Prefer: "return=representation",
       },

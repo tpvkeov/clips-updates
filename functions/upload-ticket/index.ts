@@ -1,7 +1,7 @@
 // Supabase Edge Function: upload-ticket
 // Creates a B2 single-upload URL and reserves quota through the service role.
-// Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, B2_KEY_ID,
-//          B2_APPLICATION_KEY, B2_BUCKET_NAME
+// Secrets: SUPABASE_URL, SUPABASE_SECRET_KEYS (or legacy SUPABASE_SERVICE_ROLE_KEY),
+//          B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -114,7 +114,6 @@ Deno.serve(async (req) => {
       method: "POST",
       headers: {
         apikey: serviceKey,
-        Authorization: `Bearer ${serviceKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
