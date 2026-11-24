@@ -21,7 +21,20 @@ Deno.serve(async (req) => {
 
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    // New projects expose sb_secret_... as SUPABASE_SECRET_KEYS (JSON by name).
+    // Fall back to the legacy service_role key for older projects.
+    const readServiceKey = (): string => {
+      const raw = Deno.env.get("SUPABASE_SECRET_KEYS");
+      if (raw) {
+        try {
+          const keys = JSON.parse(raw);
+          const key = keys?.default ?? Object.values(keys)[0];
+          if (typeof key === "string" && key) return key;
+        } catch (_) { /* fall through to legacy key */ }
+      }
+      return Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    };
+    const serviceKey = readServiceKey();
     const keyId = Deno.env.get("B2_KEY_ID")!;
     const appKey = Deno.env.get("B2_APPLICATION_KEY")!;
     const bucketName = Deno.env.get("B2_BUCKET_NAME") ?? "clips-videos-ithuzzzkhnbypgvmdugk";
