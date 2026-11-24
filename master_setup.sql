@@ -1619,6 +1619,20 @@ CREATE INDEX IF NOT EXISTS banned_devices_extended_idx ON public.banned_devices(
 CREATE INDEX IF NOT EXISTS banned_devices_expiry_idx ON public.banned_devices(expires_at);
 CREATE INDEX IF NOT EXISTS reports_status_idx ON public.reports(status, created_at DESC);
 
+-- =============================================================================
+-- 20) EDGE FUNCTION PRIVILEGES (service_role)
+-- Edge Functions authenticate to PostgREST with the secret service key. RLS is
+-- bypassed by that role, but Postgres table/sequence/function privileges are
+-- still required. Without this block inserts fail with 42501 permission denied.
+-- =============================================================================
+GRANT USAGE ON SCHEMA public TO service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO service_role;
+
 NOTIFY pgrst, 'reload schema';
 
 -- =============================================================================

@@ -60,8 +60,18 @@ Deno.serve(async (req) => {
     const publicUrl = String(body.publicUrl ?? "");
     const fileId = String(body.fileId ?? "").trim();
     const sizeBytes = Number(body.sizeBytes ?? 0);
-    if (!sessionId || !b2Key || !publicUrl || !fileId || sizeBytes <= 0) {
-      return json({ error: "invalid_payload" }, 400);
+    const missing: string[] = [];
+    if (!sessionId) missing.push("sessionId");
+    if (!b2Key) missing.push("b2Key");
+    if (!publicUrl) missing.push("publicUrl");
+    if (!fileId) missing.push("fileId");
+    if (!(sizeBytes > 0)) missing.push("sizeBytes");
+    if (missing.length) {
+      // Old APKs omit fileId; this makes the cause visible in the app error.
+      return json(
+        { error: "invalid_payload", missing, hint: "update app to 1.0.1055+" },
+        400,
+      );
     }
 
     let userId: string | null = null;
