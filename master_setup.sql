@@ -1635,6 +1635,99 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO service_role;
 
+-- =============================================================================
+-- 21) REAL COMMENTS + PAGINATION SUPPORT
+-- The app signs people in locally/Firebase, so it has no Supabase JWT profile
+-- row to satisfy the UUID foreign keys on comments/post_comments. This table is
+-- written only by the add-comment Edge Function with the service role, and the
+-- view below lets the app read both old and new comments in ONE request.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.app_comments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    target_type TEXT NOT NULL CHECK (target_type IN ('video', 'post')),
+    target_id TEXT NOT NULL,
+    author_key TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 2000),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS app_comments_target_idx
+    ON public.app_comments(target_type, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS app_comments_author_idx ON public.app_comments(author_key);
+ALTER TABLE public.app_comments ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "App comments are viewable by everyone" ON public.app_comments;
+CREATE POLICY "App comments are viewable by everyone" ON public.app_comments
+    FOR SELECT USING (true);
+GRANT SELECT ON public.app_comments TO anon, authenticated;
+GRANT ALL ON public.app_comments TO service_role;
+
+CREATE OR REPLACE VIEW public.app_all_comments AS
+SELECT
+    c.id::text AS id,
+    'video'::text AS target_type,
+    c.video_id::text AS target_id,
+    c.user_id::text AS user_id,
+    NULL::text AS author_name,
+    c.content,
+    c.created_at
+FROM public.comments c
+WHERE c.is_deleted = false
+UNION ALL
+SELECT
+    pc.id::text,
+    'post'::text,
+    pc.post_id::text,
+    pc.user_id::text,
+    NULL::text,
+    pc.content,
+    pc.created_at
+FROM public.post_comments pc
+WHERE pc.is_deleted = false
+UNION ALL
+SELECT
+    ac.id::text,
+    ac.target_type,
+    ac.target_id,
+    NULL::text,
+    ac.author_name,
+    ac.content,
+    ac.created_at
+FROM public.app_comments ac;
+GRANT SELECT ON public.app_all_comments TO anon, authenticated;
+
+-- Cursor pagination reads ordered by created_at; index it explicitly.
+CREATE INDEX IF NOT EXISTS social_posts_feed_idx
+    ON public.social_posts(created_at DESC) WHERE is_deleted = false;
+
+-- Keep post comment counters honest now that comments can live in either table.
+CREATE OR REPLACE VIEW public.social_feed AS
+SELECT
+    p.id,
+    p.user_id,
+    p.content,
+    p.media_type,
+    p.media_url,
+    p.thumbnail_url,
+    p.video_id,
+    p.is_sync_to_home,
+    p.pinned,
+    p.created_at,
+    pr.full_name,
+    pr.avatar_url,
+    pr.verified,
+    pr.is_admin AS author_is_admin,
+    v.is_vertical AS video_is_vertical,
+    (SELECT count(*) FROM public.post_likes l WHERE l.post_id = p.id)::BIGINT AS likes_count,
+    ((SELECT count(*) FROM public.post_comments c WHERE c.post_id = p.id AND c.is_deleted = false) +
+     (SELECT count(*) FROM public.app_comments ac WHERE ac.target_type = 'post' AND ac.target_id = p.id::text))::BIGINT AS comments_count,
+    EXISTS (SELECT 1 FROM public.post_likes l WHERE l.post_id = p.id AND l.user_id = auth.uid()) AS user_has_liked
+FROM public.social_posts p
+LEFT JOIN public.profiles pr ON p.user_id = pr.id
+LEFT JOIN public.videos v ON p.video_id = v.id
+WHERE p.is_deleted = false
+ORDER BY p.pinned DESC, p.created_at DESC;
+GRANT SELECT ON public.social_feed TO anon, authenticated;
+
 NOTIFY pgrst, 'reload schema';
 
 -- =============================================================================
