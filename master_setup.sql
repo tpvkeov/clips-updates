@@ -1731,5 +1731,542 @@ GRANT SELECT ON public.social_feed TO anon, authenticated;
 NOTIFY pgrst, 'reload schema';
 
 -- =============================================================================
--- نهاية الملف
+-- 22) COMPLETE NO-DEMO DATA MODEL
+-- الحسابات / الفيديوهات / الستوري / المنشورات / اليكات / المحفوظات / البلاغات /
+-- المشاركات / رفع صورة الحساب والبانر / تسجيل الدخول / تفاصيل البك والهاتف /
+-- صندوق قراءة البلاغات للأدمن.
+-- لا توجد أي صفوف INSERT تجريبية أو وهمية في هذا القسم.
+-- كل صف يُكتب فقط من بيانات حقيقية يرسلها التطبيق أو Edge Functions.
+-- =============================================================================
+
+-- 22.1) أعمدة مشتركة للمشاركات
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='videos' AND column_name='shares_count'
+    ) THEN ALTER TABLE public.videos ADD COLUMN shares_count BIGINT NOT NULL DEFAULT 0; END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='social_posts' AND column_name='shares_count'
+    ) THEN ALTER TABLE public.social_posts ADD COLUMN shares_count BIGINT NOT NULL DEFAULT 0; END IF;
+END $$;
+
+-- 22.2) STORIES
+CREATE TABLE IF NOT EXISTS public.stories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    media_url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    media_type TEXT NOT NULL DEFAULT 'image' CHECK (media_type IN ('image', 'video')),
+    caption TEXT,
+    duration DOUBLE PRECISION,
+    views_count BIGINT NOT NULL DEFAULT 0,
+    likes_count BIGINT NOT NULL DEFAULT 0,
+    shares_count BIGINT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + INTERVAL '24 hours'),
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS stories_active_idx ON public.stories(expires_at DESC) WHERE is_deleted = false;
+CREATE INDEX IF NOT EXISTS stories_user_idx ON public.stories(user_id, created_at DESC);
+ALTER TABLE public.stories ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON public.stories TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON public.stories TO authenticated;
+
+DROP POLICY IF EXISTS "Active stories are viewable" ON public.stories;
+CREATE POLICY "Active stories are viewable" ON public.stories FOR SELECT
+    USING (
+        (is_deleted = false AND expires_at > now())
+        OR auth.uid() = user_id
+        OR public.is_admin()
+    );
+DROP POLICY IF EXISTS "Users create own stories" ON public.stories;
+CREATE POLICY "Users create own stories" ON public.stories FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users update own stories" ON public.stories;
+CREATE POLICY "Users update own stories" ON public.stories FOR UPDATE
+    USING (auth.uid() = user_id OR public.is_admin())
+    WITH CHECK (auth.uid() = user_id OR public.is_admin());
+DROP POLICY IF EXISTS "Users delete own stories" ON public.stories;
+CREATE POLICY "Users delete own stories" ON public.stories FOR DELETE
+    USING (auth.uid() = user_id OR public.is_admin());
+DROP TRIGGER IF EXISTS trg_stories_touch ON public.stories;
+CREATE TRIGGER trg_stories_touch BEFORE UPDATE ON public.stories
+    FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+-- 22.3) مشاهدات الستوري (ضيف أو مستخدم)
+CREATE TABLE IF NOT EXISTS public.story_views (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    story_id UUID NOT NULL REFERENCES public.stories(id) ON DELETE CASCADE,
+    viewer_user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    viewer_key TEXT NOT NULL CHECK (char_length(viewer_key) BETWEEN 4 AND 180),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (story_id, viewer_key)
+);
+CREATE INDEX IF NOT EXISTS story_views_story_idx ON public.story_views(story_id, created_at DESC);
+ALTER TABLE public.story_views ENABLE ROW LEVEL SECURITY;
+GRANT INSERT ON public.story_views TO anon, authenticated;
+GRANT SELECT ON public.story_views TO authenticated;
+DROP POLICY IF EXISTS "Anyone can record a story view" ON public.story_views;
+CREATE POLICY "Anyone can record a story view" ON public.story_views FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Owners and admins view story views" ON public.story_views;
+CREATE POLICY "Owners and admins view story views" ON public.story_views FOR SELECT
+    USING (
+        public.is_admin()
+        OR EXISTS (SELECT 1 FROM public.stories s WHERE s.id = story_id AND s.user_id = auth.uid())
+    );
+
+CREATE OR REPLACE FUNCTION public.update_story_views_count()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE public.stories SET views_count = views_count + 1 WHERE id = NEW.story_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE public.stories SET views_count = GREATEST(0, views_count - 1) WHERE id = OLD.story_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_story_views_count ON public.story_views;
+CREATE TRIGGER trg_story_views_count AFTER INSERT OR DELETE ON public.story_views
+    FOR EACH ROW EXECUTE FUNCTION public.update_story_views_count();
+
+-- 22.4) لايكات الستوري (المستخدمون فقط)
+CREATE TABLE IF NOT EXISTS public.story_likes (
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    story_id UUID NOT NULL REFERENCES public.stories(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, story_id)
+);
+ALTER TABLE public.story_likes ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, DELETE ON public.story_likes TO authenticated;
+DROP POLICY IF EXISTS "Story likes are viewable by everyone" ON public.story_likes;
+CREATE POLICY "Story likes are viewable by everyone" ON public.story_likes FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Users manage own story likes" ON public.story_likes;
+CREATE POLICY "Users manage own story likes" ON public.story_likes FOR ALL USING (auth.uid() = user_id);
+CREATE OR REPLACE FUNCTION public.update_story_likes_count()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE public.stories SET likes_count = likes_count + 1 WHERE id = NEW.story_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE public.stories SET likes_count = GREATEST(0, likes_count - 1) WHERE id = OLD.story_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_story_likes_count ON public.story_likes;
+CREATE TRIGGER trg_story_likes_count AFTER INSERT OR DELETE ON public.story_likes
+    FOR EACH ROW EXECUTE FUNCTION public.update_story_likes_count();
+
+-- 22.5) المشاركات (ضيف أو مستخدم)
+CREATE TABLE IF NOT EXISTS public.shares (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    actor_key TEXT NOT NULL CHECK (char_length(actor_key) BETWEEN 4 AND 180),
+    target_type TEXT NOT NULL CHECK (target_type IN ('video', 'post', 'story')),
+    target_id TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'app'
+        CHECK (channel IN ('app', 'copy_link', 'whatsapp', 'telegram', 'facebook', 'instagram', 'x', 'other')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS shares_target_idx ON public.shares(target_type, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS shares_actor_idx ON public.shares(actor_key);
+ALTER TABLE public.shares ENABLE ROW LEVEL SECURITY;
+GRANT INSERT ON public.shares TO anon, authenticated;
+GRANT SELECT ON public.shares TO authenticated;
+DROP POLICY IF EXISTS "Anyone can record a share" ON public.shares;
+CREATE POLICY "Anyone can record a share" ON public.shares FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Owners and admins view shares" ON public.shares;
+CREATE POLICY "Owners and admins view shares" ON public.shares FOR SELECT
+    USING (public.is_admin() OR auth.uid() = user_id);
+
+CREATE OR REPLACE FUNCTION public.update_share_counts()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.target_type = 'video' THEN
+            UPDATE public.videos SET shares_count = shares_count + 1 WHERE id = NEW.target_id;
+        ELSIF NEW.target_type = 'post' THEN
+            UPDATE public.social_posts SET shares_count = shares_count + 1 WHERE id::text = NEW.target_id;
+        ELSIF NEW.target_type = 'story' THEN
+            UPDATE public.stories SET shares_count = shares_count + 1 WHERE id::text = NEW.target_id;
+        END IF;
+    ELSE
+        IF OLD.target_type = 'video' THEN
+            UPDATE public.videos SET shares_count = GREATEST(0, shares_count - 1) WHERE id = OLD.target_id;
+        ELSIF OLD.target_type = 'post' THEN
+            UPDATE public.social_posts SET shares_count = GREATEST(0, shares_count - 1) WHERE id::text = OLD.target_id;
+        ELSIF OLD.target_type = 'story' THEN
+            UPDATE public.stories SET shares_count = GREATEST(0, shares_count - 1) WHERE id::text = OLD.target_id;
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_share_counts ON public.shares;
+CREATE TRIGGER trg_share_counts AFTER INSERT OR DELETE ON public.shares
+    FOR EACH ROW EXECUTE FUNCTION public.update_share_counts();
+
+-- 22.6) حفظ المنشورات (بجانب saved_videos الموجود)
+CREATE TABLE IF NOT EXISTS public.saved_posts (
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    post_id UUID NOT NULL REFERENCES public.social_posts(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, post_id)
+);
+CREATE INDEX IF NOT EXISTS saved_posts_user_idx ON public.saved_posts(user_id, created_at DESC);
+ALTER TABLE public.saved_posts ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, DELETE ON public.saved_posts TO authenticated;
+DROP POLICY IF EXISTS "Users manage own saved posts" ON public.saved_posts;
+CREATE POLICY "Users manage own saved posts" ON public.saved_posts FOR ALL USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Admins view saved posts" ON public.saved_posts;
+CREATE POLICY "Admins view saved posts" ON public.saved_posts FOR SELECT USING (public.is_admin());
+
+GRANT SELECT ON public.saved_videos TO authenticated;
+DROP POLICY IF EXISTS "Admins view saved videos" ON public.saved_videos;
+CREATE POLICY "Admins view saved videos" ON public.saved_videos FOR SELECT USING (public.is_admin());
+
+-- 22.7) رفع صورة الحساب والبانر (Supabase Storage فقط، لا مفاتيح B2 هنا)
+CREATE TABLE IF NOT EXISTS public.profile_media_uploads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    media_type TEXT NOT NULL CHECK (media_type IN ('avatar', 'banner')),
+    bucket TEXT NOT NULL CHECK (bucket IN ('avatars', 'banners')),
+    object_path TEXT NOT NULL,
+    public_url TEXT NOT NULL,
+    mime_type TEXT,
+    size_bytes BIGINT CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    width INTEGER,
+    height INTEGER,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS profile_media_one_active_idx
+    ON public.profile_media_uploads(user_id, media_type) WHERE is_active;
+CREATE INDEX IF NOT EXISTS profile_media_user_idx ON public.profile_media_uploads(user_id, created_at DESC);
+ALTER TABLE public.profile_media_uploads ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON public.profile_media_uploads TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON public.profile_media_uploads TO authenticated;
+DROP POLICY IF EXISTS "Active profile media is public" ON public.profile_media_uploads;
+CREATE POLICY "Active profile media is public" ON public.profile_media_uploads FOR SELECT
+    USING (is_active OR auth.uid() = user_id OR public.is_admin());
+DROP POLICY IF EXISTS "Users manage own profile media" ON public.profile_media_uploads;
+CREATE POLICY "Users manage own profile media" ON public.profile_media_uploads FOR ALL
+    USING (auth.uid() = user_id OR public.is_admin())
+    WITH CHECK (auth.uid() = user_id OR public.is_admin());
+
+CREATE OR REPLACE FUNCTION public.deactivate_previous_profile_media()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF NEW.is_active THEN
+        UPDATE public.profile_media_uploads
+           SET is_active = FALSE
+         WHERE user_id = NEW.user_id
+           AND media_type = NEW.media_type
+           AND id <> NEW.id
+           AND is_active;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_profile_media_single_active ON public.profile_media_uploads;
+CREATE TRIGGER trg_profile_media_single_active
+    BEFORE INSERT OR UPDATE OF is_active ON public.profile_media_uploads
+    FOR EACH ROW EXECUTE FUNCTION public.deactivate_previous_profile_media();
+
+CREATE OR REPLACE FUNCTION public.sync_profile_media_to_profile()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF NEW.is_active AND NEW.media_type = 'avatar' THEN
+        UPDATE public.profiles SET avatar_url = NEW.public_url WHERE id = NEW.user_id;
+    ELSIF NEW.is_active AND NEW.media_type = 'banner' THEN
+        UPDATE public.profiles SET banner_url = NEW.public_url WHERE id = NEW.user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_profile_media_sync ON public.profile_media_uploads;
+CREATE TRIGGER trg_profile_media_sync
+    AFTER INSERT OR UPDATE OF is_active, public_url ON public.profile_media_uploads
+    FOR EACH ROW EXECUTE FUNCTION public.sync_profile_media_to_profile();
+
+-- 22.8) تسجيل الدخول (audit فقط - لا كلمات مرور ولا رموز سرية)
+CREATE TABLE IF NOT EXISTS public.login_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    login_key TEXT NOT NULL CHECK (char_length(login_key) BETWEEN 8 AND 200),
+    provider TEXT NOT NULL DEFAULT 'supabase'
+        CHECK (provider IN ('supabase', 'email', 'phone', 'google', 'apple', 'anonymous')),
+    device_id TEXT,
+    ip_hash TEXT,
+    user_agent TEXT,
+    success BOOLEAN NOT NULL DEFAULT TRUE,
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS login_events_user_idx ON public.login_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS login_events_key_idx ON public.login_events(login_key);
+ALTER TABLE public.login_events ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.login_events FROM anon, authenticated;
+GRANT SELECT, INSERT ON public.login_events TO authenticated;
+GRANT ALL ON public.login_events TO service_role;
+DROP POLICY IF EXISTS "Admins view login events" ON public.login_events;
+CREATE POLICY "Admins view login events" ON public.login_events FOR SELECT USING (public.is_admin());
+DROP POLICY IF EXISTS "Users log their own sign-in" ON public.login_events;
+CREATE POLICY "Users log their own sign-in" ON public.login_events FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+
+CREATE OR REPLACE FUNCTION public.record_login_event(
+    p_user_id UUID,
+    p_login_key TEXT,
+    p_provider TEXT DEFAULT 'supabase',
+    p_device_id TEXT DEFAULT NULL,
+    p_ip_hash TEXT DEFAULT NULL,
+    p_user_agent TEXT DEFAULT NULL,
+    p_success BOOLEAN DEFAULT TRUE,
+    p_failure_reason TEXT DEFAULT NULL
+)
+RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+    v_id UUID;
+BEGIN
+    IF p_login_key IS NULL OR char_length(p_login_key) NOT BETWEEN 8 AND 200 THEN
+        RAISE EXCEPTION 'invalid login_key' USING ERRCODE = '22023';
+    END IF;
+    IF p_user_id IS NOT NULL AND auth.uid() IS DISTINCT FROM p_user_id THEN
+        RAISE EXCEPTION 'not allowed' USING ERRCODE = '42501';
+    END IF;
+    INSERT INTO public.login_events (
+        user_id, login_key, provider, device_id, ip_hash, user_agent, success, failure_reason
+    ) VALUES (
+        p_user_id, p_login_key, p_provider, p_device_id, p_ip_hash, p_user_agent, p_success, p_failure_reason
+    ) RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION public.record_login_event(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT)
+    TO anon, authenticated;
+
+-- 22.9) تفاصيل الهاتف/التطبيق (بدون IP خام أو بيانات حساسة)
+CREATE TABLE IF NOT EXISTS public.phone_diagnostics (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL CHECK (char_length(device_id) BETWEEN 4 AND 180),
+    app_version TEXT,
+    android_version TEXT,
+    device_model TEXT,
+    manufacturer TEXT,
+    abi TEXT,
+    locale TEXT,
+    timezone TEXT,
+    screen_width INTEGER,
+    screen_height INTEGER,
+    screen_density REAL,
+    network_type TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS phone_diagnostics_user_idx ON public.phone_diagnostics(user_id, created_at DESC);
+ALTER TABLE public.phone_diagnostics ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT ON public.phone_diagnostics TO authenticated;
+GRANT ALL ON public.phone_diagnostics TO service_role;
+DROP POLICY IF EXISTS "Users view own phone diagnostics" ON public.phone_diagnostics;
+CREATE POLICY "Users view own phone diagnostics" ON public.phone_diagnostics FOR SELECT
+    USING (auth.uid() = user_id OR public.is_admin());
+DROP POLICY IF EXISTS "Users insert own phone diagnostics" ON public.phone_diagnostics;
+CREATE POLICY "Users insert own phone diagnostics" ON public.phone_diagnostics FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+
+-- 22.10) إعدادات البك/الخلفية غير السرية (يُمنع حفظ أي مفتاح هنا)
+CREATE TABLE IF NOT EXISTS public.backend_settings (
+    key TEXT PRIMARY KEY
+        CHECK (key !~* '(secret|token|password|api[_-]?key|private[_-]?key|credential)'),
+    value JSONB NOT NULL DEFAULT '{}'::jsonb,
+    description TEXT,
+    is_public BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL
+);
+ALTER TABLE public.backend_settings ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON public.backend_settings TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON public.backend_settings TO authenticated;
+DROP POLICY IF EXISTS "Public backend settings" ON public.backend_settings;
+CREATE POLICY "Public backend settings" ON public.backend_settings FOR SELECT
+    USING (is_public OR public.is_admin());
+DROP POLICY IF EXISTS "Admins manage backend settings" ON public.backend_settings;
+CREATE POLICY "Admins manage backend settings" ON public.backend_settings FOR ALL
+    USING (public.is_admin()) WITH CHECK (public.is_admin());
+DROP TRIGGER IF EXISTS trg_backend_settings_touch ON public.backend_settings;
+CREATE TRIGGER trg_backend_settings_touch BEFORE UPDATE ON public.backend_settings
+    FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+-- الأدمن يقرأ تفاصيل البك الموجودة فعلاً دون كشف أي سر
+GRANT SELECT ON public.storage_usage TO authenticated;
+GRANT SELECT ON public.b2_upload_sessions TO authenticated;
+DROP POLICY IF EXISTS "Admins view B2 upload sessions" ON public.b2_upload_sessions;
+CREATE POLICY "Admins view B2 upload sessions" ON public.b2_upload_sessions FOR SELECT
+    USING (public.is_admin());
+
+-- 22.11) جداول/مشاهد القراءة للأدمن
+GRANT SELECT ON public.reports TO authenticated;
+GRANT INSERT ON public.reports TO anon;
+
+CREATE OR REPLACE VIEW public.admin_report_inbox
+WITH (security_invoker = true) AS
+SELECT
+    r.id,
+    r.reporter_user_id,
+    pr.full_name AS reporter_name,
+    pr.avatar_url AS reporter_avatar_url,
+    r.reporter_fingerprint,
+    r.target_type,
+    r.target_id,
+    r.reason,
+    r.details,
+    r.status,
+    r.created_at
+FROM public.reports r
+LEFT JOIN public.profiles pr ON pr.id = r.reporter_user_id
+ORDER BY r.created_at DESC;
+GRANT SELECT ON public.admin_report_inbox TO authenticated;
+
+CREATE OR REPLACE VIEW public.admin_login_audit
+WITH (security_invoker = true) AS
+SELECT
+    l.id,
+    l.user_id,
+    pr.full_name AS user_name,
+    l.provider,
+    l.success,
+    l.failure_reason,
+    l.device_id,
+    l.ip_hash,
+    l.user_agent,
+    l.created_at
+FROM public.login_events l
+LEFT JOIN public.profiles pr ON pr.id = l.user_id
+ORDER BY l.created_at DESC;
+GRANT SELECT ON public.admin_login_audit TO authenticated;
+
+CREATE OR REPLACE VIEW public.admin_phone_audit
+WITH (security_invoker = true) AS
+SELECT
+    d.id,
+    d.user_id,
+    pr.full_name AS user_name,
+    d.device_id,
+    d.app_version,
+    d.android_version,
+    d.device_model,
+    d.manufacturer,
+    d.abi,
+    d.locale,
+    d.timezone,
+    d.screen_width,
+    d.screen_height,
+    d.screen_density,
+    d.network_type,
+    d.created_at
+FROM public.phone_diagnostics d
+LEFT JOIN public.profiles pr ON pr.id = d.user_id
+ORDER BY d.created_at DESC;
+GRANT SELECT ON public.admin_phone_audit TO authenticated;
+
+CREATE OR REPLACE VIEW public.admin_backend_overview
+WITH (security_invoker = true) AS
+SELECT
+    'storage'::text AS area,
+    s.bucket AS key,
+    jsonb_build_object(
+        'used_bytes', s.used_bytes,
+        'limit_bytes', s.limit_bytes,
+        'updated_at', s.updated_at
+    ) AS details,
+    s.updated_at
+FROM public.storage_usage s
+UNION ALL
+SELECT
+    'b2_session'::text,
+    b.session_id::text,
+    jsonb_build_object(
+        'status', b.status,
+        'upload_type', b.upload_type,
+        'expected_size', b.expected_size,
+        'video_id', b.video_id,
+        'created_at', b.created_at,
+        'expires_at', b.expires_at
+    ),
+    b.created_at
+FROM public.b2_upload_sessions b
+UNION ALL
+SELECT
+    'setting'::text,
+    t.key,
+    t.value,
+    t.updated_at
+FROM public.backend_settings t;
+GRANT SELECT ON public.admin_backend_overview TO authenticated;
+
+-- 22.12) مشاهد قراءة المحتوى الحقيقي
+CREATE OR REPLACE VIEW public.stories_feed
+WITH (security_invoker = true) AS
+SELECT
+    s.id,
+    s.user_id,
+    s.media_url,
+    s.thumbnail_url,
+    s.media_type,
+    s.caption,
+    s.duration,
+    s.views_count,
+    s.likes_count,
+    s.shares_count,
+    s.expires_at,
+    s.created_at,
+    pr.full_name,
+    pr.avatar_url,
+    pr.verified,
+    EXISTS (
+        SELECT 1 FROM public.story_views v
+        WHERE v.story_id = s.id AND v.viewer_user_id = auth.uid()
+    ) AS user_has_viewed,
+    EXISTS (
+        SELECT 1 FROM public.story_likes l
+        WHERE l.story_id = s.id AND l.user_id = auth.uid()
+    ) AS user_has_liked
+FROM public.stories s
+LEFT JOIN public.profiles pr ON pr.id = s.user_id
+WHERE s.is_deleted = false AND s.expires_at > now()
+ORDER BY s.created_at DESC;
+GRANT SELECT ON public.stories_feed TO anon, authenticated;
+
+CREATE OR REPLACE VIEW public.saved_items
+WITH (security_invoker = true) AS
+SELECT
+    'video'::text AS item_type,
+    v.id,
+    v.title AS label,
+    v.video_url AS media_url,
+    v.thumbnail_url,
+    sv.created_at
+FROM public.saved_videos sv
+JOIN public.videos v ON v.id = sv.video_id
+UNION ALL
+SELECT
+    'post'::text,
+    p.id::text,
+    COALESCE(p.content, '') AS label,
+    p.media_url,
+    p.thumbnail_url,
+    sp.created_at
+FROM public.saved_posts sp
+JOIN public.social_posts p ON p.id = sp.post_id;
+GRANT SELECT ON public.saved_items TO authenticated;
+
+NOTIFY pgrst, 'reload schema';
+
+-- =============================================================================
+-- نهاية الملف - لا بيانات وهمية أو تجريبية
 -- =============================================================================
